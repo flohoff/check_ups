@@ -20,9 +20,16 @@ package SNMP;
 							3 => 'batteryLow',
 							4 => 'batteryDepleted'
 						}},
-		"upsEstimatedMinutesRemaining" => { oid => ".1.3.6.1.2.1.33.1.2.3" },
+		"upsEstimatedMinutesRemaining" => { oid => ".1.3.6.1.2.1.33.1.2.3",
+					value => 'fixupdecimal' },
 		"upsEstimatedChargeRemaining" => { oid => ".1.3.6.1.2.1.33.1.2.4" },
-		"upsAlarmsPresent"	=> { oid => ".1.3.6.1.2.1.33.1.6.1" }
+		"upsAlarmsPresent"	=> { oid => ".1.3.6.1.2.1.33.1.6.1" },
+		"upsOutputVoltage"	=> { oid => ".1.3.6.1.2.1.33.1.4.4.1.2" },
+		"upsOutputCurrent"	=> { oid => ".1.3.6.1.2.1.33.1.4.4.1.3" },
+		"upsOutputPower"	=> { oid => ".1.3.6.1.2.1.33.1.4.4.1.4" },
+		"upsOutputPercentLoad"	=> { oid => ".1.3.6.1.2.1.33.1.4.4.1.5" },
+		"upsConfigOutputVA"	=> { oid => ".1.3.6.1.2.1.33.1.9.5" },
+		"upsConfigOutputPower"	=> { oid => ".1.3.6.1.2.1.33.1.9.6" }
 	};
 
 	sub new {
@@ -109,6 +116,14 @@ package SNMP;
 		return { value => $value };
 	}
 
+	sub value_decode_fixup_decimal {
+		my ($self, $value, $def) = @_;
+
+		$value=~s/,//g;
+
+		return { value => $value };
+	}
+
 	sub value_decode {
 		my ($self, $name, $value) = @_;
 
@@ -119,6 +134,8 @@ package SNMP;
 
 		if ($def->{value} eq "table") {
 			return $self->value_decode_table($value, $def);
+		} elsif ($def->{value} eq "fixupdecimal") {
+			return $self->value_decode_fixup_decimal($value, $def);
 		}
 
 		return { value => $value };
@@ -177,7 +194,6 @@ package SNMP;
 
 		return $r;
 	}
-
 	
 	sub get {
 		my ($self, @args) = @_;
@@ -185,6 +201,13 @@ package SNMP;
 		my $r=$self->{netsnmp}->get_request(-varbindlist =>
 			$self->_parse_request(@args));
 
+		return $self->_parse_response($r, $self->{netsnmp}->error());
+	}
+
+	sub walk {
+		my ($self, $base) = @_;
+
+		my $r=$self->{netsnmp}->get_table(-baseoid => $self->name2oid($base));
 		return $self->_parse_response($r, $self->{netsnmp}->error());
 	}
 
@@ -214,6 +237,7 @@ package UPS;
 		}
 		$self->battery_read();
 		$self->alarm_read();
+		$self->output_read();
 	}
 
 	sub error {
@@ -235,6 +259,62 @@ package UPS;
 		my $count=$alarms->{"upsAlarmsPresent.0"}{value}{value};
 
 		return $count;
+	}
+
+	sub merge_tables_by_instance {
+		my ($self, @tables) = @_;
+
+		my $result={};
+
+		foreach my $table ( @tables ) {
+			foreach my $k ( keys %${table} ) {
+				next if ($k =~ /_error/);
+				my $v=$table->{$k};
+
+				my $i=$v->{instance};
+				$i=~s/^\.//;
+				$result->{$i}{$v->{name}}=$v->{value};
+			}
+		}
+
+		return $result;
+	}
+
+	sub output_read {
+		my ($self) = @_;
+
+		$self->{configoutput}=$self->{snmp}->get(
+			"upsConfigOutputVA.0",
+			"upsConfigOutputPower.0");
+
+		my $power=$self->{snmp}->walk("upsOutputPower");
+		my $current=$self->{snmp}->walk("upsOutputCurrent");
+		my $perc=$self->{snmp}->walk("upsOutputPercentLoad");
+		my $volt=$self->{snmp}->walk("upsOutputVoltage");
+
+		$self->{output}=$self->merge_tables_by_instance($power, $current, $perc, $volt);
+	}
+
+	sub output_config_va {
+		my ($self) = @_;
+		return $self->{configoutput}{"upsConfigOutputVA.0"}{value}{value};
+	}
+
+	sub output_config_power {
+		my ($self) = @_;
+		return $self->{configoutput}{"upsConfigOutputPower.0"}{value}{value};
+	}
+
+	sub outputs {
+		my ($self) = @_;
+
+		return $self->{output};
+	}
+
+	sub output_num {
+		my ($self) = @_;
+
+		return keys %{$self->{output}};
 	}
 
 	sub battery_read {
@@ -328,8 +408,10 @@ package main;
 		[ 'host|H=s',		"Nexenta hostname", { required => 1 } ],
 		[ 'community|C=s',	"Nexenta hostname", { default => 'public' } ],
 		[ 'timeout|t=i',	"Timeout", { default => 15 } ],
-		[ 'brw=s',		"Battery minutes remaining warning", { default => "10:" } ],
-		[ 'brc=s',		"Battery minutes remaining critical", { default => "5:" } ],
+		[ 'brw=s',		"Battery minutes remaining warning", { default => "10" } ],
+		[ 'brc=s',		"Battery minutes remaining critical", { default => "5" } ],
+		[ 'olw=s',		"Output load warning", { default => ":80" } ],
+		[ 'olc=s',		"Output load critical", { default => ":90" } ],
 		[],
 		[ 'help',               "print usage message and exit", { shortcircuit => 1 } ],
 	);
@@ -356,23 +438,68 @@ package main;
 
 
 	my $minremainingt=$np->set_thresholds(
-		warning => $opt->brw,
-		critical => $opt->brc );
+		warning => $opt->brw . ":",
+		critical => $opt->brc . ":");
 	my $minremaining=$ups->battery_time_remaining_minutes();
 	$np->add_perfdata(
-		label => "Time Remain",
+		label => "Time remain",
 		value => $minremaining,
 		threshold => $minremainingt
 	);
 	my $bcode=$minremainingt->get_status($minremaining);
-	$np->add_message($bcode, sprintf("Battery remaining time: %d", $minremaining));
-
+	$np->add_message($bcode, sprintf("Battery remaining time: %dmin", $minremaining));
 
 	$np->add_perfdata(
-		label => "Charge Remain",
+		label => "Charge remain",
 		value => $ups->battery_left_percentage(),
-		uom => '%'
+		uom => '%',
+		min => 0,
+		max => 100
 	);
+
+
+
+
+	my $outputt=$np->set_thresholds(
+		warning => $opt->olw,
+		critical => $opt->olc);
+
+	my $olist=$ups->outputs();
+	foreach my $id ( keys %{$olist} ) {
+		my $o=$olist->{$id};
+
+		$np->add_perfdata(
+			label => sprintf("Output %d power (W)", $id),
+			value => $o->{upsOutputPower}{value},
+			min => 0,
+			max => $ups->output_config_power()
+		);
+
+		$np->add_perfdata(
+			label => sprintf("Output %d power (VA)", $id),
+			value => $o->{upsOutputCurrent}{value}*$o->{upsOutputVoltage}{value}/10,
+			min => 0,
+			max => $ups->output_config_va()
+		);
+
+
+		$np->add_perfdata(
+			label => sprintf("Output %d current", $id),
+			value => sprintf("%.1f", $o->{upsOutputCurrent}{value}/10)
+		);
+
+		my $load=$o->{upsOutputPercentLoad}{value};
+		my $ocode=$outputt->get_status($load);
+		$np->add_message($ocode, sprintf("Output %d load: %d%%", $id, $load));
+		$np->add_perfdata(
+			label => sprintf("Output %d load", $id),
+			value => $load,
+			threshold => $outputt,
+			uom => '%',
+			min => 0,
+			max => 100
+		);
+	}
 
 	my ($code, $message) = $np->check_messages();
 	$np->plugin_exit( $code, $message );
